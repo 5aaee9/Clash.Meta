@@ -1,7 +1,6 @@
 package sniffer
 
 import (
-	"github.com/Dreamacro/clash/common/atomic"
 	"sync"
 )
 
@@ -11,7 +10,7 @@ type quicConnection struct {
 	dataLength uint
 	// callback for connection done
 	done   chan struct{}
-	closed atomic.Bool
+	closed bool
 
 	ret *string
 	id  []byte
@@ -43,8 +42,10 @@ func (conn *quicConnection) TryAssemble() error {
 }
 
 func (conn *quicConnection) close() {
-	if !conn.closed.Load() {
+	conn.lock.Lock()
+	if !conn.closed {
 		close(conn.done)
-		conn.closed.Store(true)
+		conn.closed = true
 	}
+	conn.lock.Unlock()
 }

@@ -23,6 +23,10 @@ const (
 	version1       uint32 = 0x1
 	// RFC9000 7.5. Implementations MUST support buffering at least 4096 bytes of data received in out-of-order CRYPTO frames.
 	quicCryptoSize = 4096
+	// Remember connection sniffed domain through Destination Connection ID
+	quicWaitConn          = time.Second * 10
+	quicPacketTypeInitial = 0x00
+	quicPacketType0RTT    = 0x01
 )
 
 var (
@@ -66,10 +70,6 @@ func (sniffer *QuicSniffer) SniffData(b []byte) (string, error) {
 
 	<-data.done
 
-	sniffer.connLock.Lock()
-	delete(sniffer.conn, string(data.id))
-	sniffer.connLock.Unlock()
-
 	data.lock.RLock()
 	defer data.lock.RUnlock()
 	if data.ret != nil {
@@ -93,8 +93,13 @@ func (sniffer *QuicSniffer) getOrCreateConn(id []byte) *quicConnection {
 	sniffer.connLock.Unlock()
 
 	go func() {
-		<-time.After(time.Second)
+		// Ensure quic packet cleanup
+		<-time.After(quicWaitConn)
 		conn.close()
+
+		sniffer.connLock.Lock()
+		delete(sniffer.conn, string(id))
+		sniffer.connLock.Unlock()
 	}()
 
 	return conn
@@ -133,7 +138,13 @@ func (sniffer *QuicSniffer) readQuicData(b []byte) (*quicConnection, error) {
 
 	conn := sniffer.getOrCreateConn(destConnID)
 
-	if (typeByte&0x30)>>4 != 0x0 {
+	packetType := (typeByte & 0x30) >> 4
+	if packetType != quicPacketTypeInitial {
+		// Wait initial sniffer for 0rtt packet
+		if packetType == quicPacketType0RTT {
+			return conn, nil
+		}
+
 		conn.close()
 		return nil, errNotQuicInitial
 	}
