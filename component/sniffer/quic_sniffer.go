@@ -6,14 +6,14 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
-	"io"
-
 	"github.com/Dreamacro/clash/common/buf"
 	"github.com/Dreamacro/clash/common/utils"
 	C "github.com/Dreamacro/clash/constant"
-
 	"github.com/metacubex/quic-go/quicvarint"
 	"golang.org/x/crypto/hkdf"
+	"io"
+	"sync"
+	"time"
 )
 
 // Modified from https://github.com/v2fly/v2ray-core/blob/master/common/protocol/quic/sniff.go
@@ -21,6 +21,8 @@ import (
 const (
 	versionDraft29 uint32 = 0xff00001d
 	version1       uint32 = 0x1
+	// RFC9000 7.5. Implementations MUST support buffering at least 4096 bytes of data received in out-of-order CRYPTO frames.
+	quicCryptoSize = 4096
 )
 
 var (
@@ -32,6 +34,9 @@ var (
 
 type QuicSniffer struct {
 	*BaseSniffer
+
+	conn     map[string]*quicConnection
+	connLock sync.RWMutex
 }
 
 func NewQuicSniffer(snifferConfig SnifferConfig) (*QuicSniffer, error) {
@@ -40,71 +45,117 @@ func NewQuicSniffer(snifferConfig SnifferConfig) (*QuicSniffer, error) {
 		ports = utils.IntRanges[uint16]{utils.NewRange[uint16](443, 443)}
 	}
 	return &QuicSniffer{
+		conn:        make(map[string]*quicConnection),
 		BaseSniffer: NewBaseSniffer(ports, C.UDP),
 	}, nil
 }
 
-func (quic QuicSniffer) Protocol() string {
+func (sniffer *QuicSniffer) Protocol() string {
 	return "quic"
 }
 
-func (quic QuicSniffer) SupportNetwork() C.NetWork {
+func (sniffer *QuicSniffer) SupportNetwork() C.NetWork {
 	return C.UDP
 }
 
-func (quic QuicSniffer) SniffData(b []byte) (string, error) {
+func (sniffer *QuicSniffer) SniffData(b []byte) (string, error) {
+	data, err := sniffer.readQuicData(b)
+	if err != nil {
+		return "", err
+	}
+
+	<-data.done
+
+	sniffer.connLock.Lock()
+	delete(sniffer.conn, string(data.id))
+	sniffer.connLock.Unlock()
+
+	data.lock.RLock()
+	defer data.lock.RUnlock()
+	if data.ret != nil {
+		return *data.ret, nil
+	}
+
+	return "", errNotQuic
+}
+
+func (sniffer *QuicSniffer) getOrCreateConn(id []byte) *quicConnection {
+	sniffer.connLock.RLock()
+	if conn, ok := sniffer.conn[string(id)]; ok {
+		defer sniffer.connLock.RUnlock()
+		return conn
+	}
+	sniffer.connLock.RUnlock()
+
+	sniffer.connLock.Lock()
+	conn := newQuicConnection(id)
+	sniffer.conn[string(id)] = conn
+	sniffer.connLock.Unlock()
+
+	go func() {
+		<-time.After(time.Second)
+		conn.close()
+	}()
+
+	return conn
+}
+
+func (sniffer *QuicSniffer) readQuicData(b []byte) (*quicConnection, error) {
 	buffer := buf.As(b)
 	typeByte, err := buffer.ReadByte()
 	if err != nil {
-		return "", errNotQuic
+		return nil, errNotQuic
 	}
 	isLongHeader := typeByte&0x80 > 0
 	if !isLongHeader || typeByte&0x40 == 0 {
-		return "", errNotQuicInitial
+		return nil, errNotQuicInitial
 	}
 
 	vb, err := buffer.ReadBytes(4)
 	if err != nil {
-		return "", errNotQuic
+		return nil, errNotQuic
 	}
 
 	versionNumber := binary.BigEndian.Uint32(vb)
 
 	if versionNumber != 0 && typeByte&0x40 == 0 {
-		return "", errNotQuic
+		return nil, errNotQuic
 	} else if versionNumber != versionDraft29 && versionNumber != version1 {
-		return "", errNotQuic
-	}
-
-	if (typeByte&0x30)>>4 != 0x0 {
-		return "", errNotQuicInitial
+		return nil, errNotQuic
 	}
 
 	var destConnID []byte
 	if l, err := buffer.ReadByte(); err != nil {
-		return "", errNotQuic
+		return nil, errNotQuic
 	} else if destConnID, err = buffer.ReadBytes(int(l)); err != nil {
-		return "", errNotQuic
+		return nil, errNotQuic
+	}
+
+	conn := sniffer.getOrCreateConn(destConnID)
+
+	if (typeByte&0x30)>>4 != 0x0 {
+		conn.close()
+		return nil, errNotQuicInitial
 	}
 
 	if l, err := buffer.ReadByte(); err != nil {
-		return "", errNotQuic
+		return nil, errNotQuic
 	} else if _, err := buffer.ReadBytes(int(l)); err != nil {
-		return "", errNotQuic
+		return nil, errNotQuic
 	}
 
 	tokenLen, err := quicvarint.Read(buffer)
 	if err != nil || tokenLen > uint64(len(b)) {
-		return "", errNotQuic
+		return nil, errNotQuic
 	}
 
 	if _, err = buffer.ReadBytes(int(tokenLen)); err != nil {
-		return "", errNotQuic
+		return nil, errNotQuic
 	}
 
 	packetLen, err := quicvarint.Read(buffer)
 	if err != nil {
-		return "", errNotQuic
+		return nil, errNotQuic
 	}
 
 	hdrLen := len(b) - buffer.Len()
@@ -120,7 +171,7 @@ func (quic QuicSniffer) SniffData(b []byte) (string, error) {
 	hpKey := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic hp", 16)
 	block, err := aes.NewCipher(hpKey)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	cache := buf.NewPacket()
@@ -130,6 +181,7 @@ func (quic QuicSniffer) SniffData(b []byte) (string, error) {
 	block.Encrypt(mask, b[hdrLen+4:hdrLen+4+16])
 	firstByte := b[0]
 	// Encrypt/decrypt first byte.
+
 	if isLongHeader {
 		// Long header: 4 bits masked
 		// High 4 bits are not protected.
@@ -153,22 +205,19 @@ func (quic QuicSniffer) SniffData(b []byte) (string, error) {
 		packetNumber[i] ^= mask[1+i]
 	}
 
-	if packetNumber[0] != 0 && packetNumber[0] != 1 {
-		return "", errNotQuicInitial
-	}
-
 	data := b[extHdrLen : int(packetLen)+hdrLen]
 
 	key := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic key", 16)
 	iv := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic iv", 12)
 	aesCipher, err := aes.NewCipher(key)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	aead, err := cipher.NewGCM(aesCipher)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+
 	// We only decrypt once, so we do not need to XOR it back.
 	// https://github.com/quic-go/qtls-go1-20/blob/e132a0e6cb45e20ac0b705454849a11d09ba5a54/cipher_suites.go#L496
 	for i, b := range packetNumber {
@@ -177,12 +226,11 @@ func (quic QuicSniffer) SniffData(b []byte) (string, error) {
 	dst := cache.Extend(len(data))
 	decrypted, err := aead.Open(dst[:0], iv, data, extHdr)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+
 	buffer = buf.As(decrypted)
 
-	cryptoLen := uint(0)
-	cryptoData := cache.Extend(buffer.Len())
 	for i := 0; !buffer.IsEmpty(); i++ {
 		frameType := byte(0x0) // Default to PADDING frame
 		for frameType == 0x0 && !buffer.IsEmpty() {
@@ -193,79 +241,81 @@ func (quic QuicSniffer) SniffData(b []byte) (string, error) {
 		case 0x01: // PING frame
 		case 0x02, 0x03: // ACK frame
 			if _, err = quicvarint.Read(buffer); err != nil { // Field: Largest Acknowledged
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 			if _, err = quicvarint.Read(buffer); err != nil { // Field: ACK Delay
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 			ackRangeCount, err := quicvarint.Read(buffer) // Field: ACK Range Count
 			if err != nil {
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 			if _, err = quicvarint.Read(buffer); err != nil { // Field: First ACK Range
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 			for i := 0; i < int(ackRangeCount); i++ { // Field: ACK Range
 				if _, err = quicvarint.Read(buffer); err != nil { // Field: ACK Range -> Gap
-					return "", io.ErrUnexpectedEOF
+					return nil, io.ErrUnexpectedEOF
 				}
 				if _, err = quicvarint.Read(buffer); err != nil { // Field: ACK Range -> ACK Range Length
-					return "", io.ErrUnexpectedEOF
+					return nil, io.ErrUnexpectedEOF
 				}
 			}
 			if frameType == 0x03 {
 				if _, err = quicvarint.Read(buffer); err != nil { // Field: ECN Counts -> ECT0 Count
-					return "", io.ErrUnexpectedEOF
+					return nil, io.ErrUnexpectedEOF
 				}
 				if _, err = quicvarint.Read(buffer); err != nil { // Field: ECN Counts -> ECT1 Count
-					return "", io.ErrUnexpectedEOF
+					return nil, io.ErrUnexpectedEOF
 				}
 				if _, err = quicvarint.Read(buffer); err != nil { //nolint:misspell // Field: ECN Counts -> ECT-CE Count
-					return "", io.ErrUnexpectedEOF
+					return nil, io.ErrUnexpectedEOF
 				}
 			}
 		case 0x06: // CRYPTO frame, we will use this frame
 			offset, err := quicvarint.Read(buffer) // Field: Offset
 			if err != nil {
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 			length, err := quicvarint.Read(buffer) // Field: Length
 			if err != nil || length > uint64(buffer.Len()) {
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
-			if cryptoLen < uint(offset+length) {
-				cryptoLen = uint(offset + length)
+
+			conn.lock.Lock()
+			if conn.dataLength < uint(offset+length) {
+				conn.dataLength = uint(offset + length)
 			}
-			if _, err := buffer.Read(cryptoData[offset : offset+length]); err != nil { // Field: Crypto Data
-				return "", io.ErrUnexpectedEOF
+
+			if _, err := buffer.Read(conn.buffer[offset : offset+length]); err != nil { // Field: Crypto Data
+				conn.lock.Unlock()
+				return nil, io.ErrUnexpectedEOF
 			}
+			conn.lock.Unlock()
 		case 0x1c: // CONNECTION_CLOSE frame, only 0x1c is permitted in initial packet
 			if _, err = quicvarint.Read(buffer); err != nil { // Field: Error Code
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 			if _, err = quicvarint.Read(buffer); err != nil { // Field: Frame Type
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 			length, err := quicvarint.Read(buffer) // Field: Reason Phrase Length
 			if err != nil {
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 			if _, err := buffer.ReadBytes(int(length)); err != nil { // Field: Reason Phrase
-				return "", io.ErrUnexpectedEOF
+				return nil, io.ErrUnexpectedEOF
 			}
 		default:
 			// Only above frame types are permitted in initial packet.
 			// See https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.2-8
-			return "", errNotQuicInitial
+			return nil, errNotQuicInitial
 		}
 	}
 
-	domain, err := ReadClientHello(cryptoData[:cryptoLen])
-	if err != nil {
-		return "", err
-	}
+	_ = conn.TryAssemble()
 
-	return *domain, nil
+	return conn, nil
 }
 
 func hkdfExpandLabel(hash crypto.Hash, secret, context []byte, label string, length int) []byte {
