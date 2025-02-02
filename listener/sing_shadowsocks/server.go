@@ -14,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/listener/sing"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
+	"github.com/samber/lo"
 
 	shadowsocks "github.com/metacubex/sing-shadowsocks"
 	"github.com/metacubex/sing-shadowsocks/shadowaead"
@@ -68,7 +69,23 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 	case common.Contains(shadowaead.List, config.Cipher):
 		sl.service, err = shadowaead.NewService(config.Cipher, nil, config.Password, udpTimeout, h)
 	case common.Contains(shadowaead_2022.List, config.Cipher):
-		sl.service, err = shadowaead_2022.NewServiceWithPassword(config.Cipher, config.Password, udpTimeout, h, ntp.Now)
+		if len(config.MultiUsers) > 0 {
+			sl.service, err = shadowaead_2022.NewMultiServiceWithPassword[string](config.Cipher, config.Password, udpTimeout, h, ntp.Now)
+			if err == nil {
+				srv := sl.service.(*shadowaead_2022.MultiService[string])
+				userNames := lo.Map(config.MultiUsers, func(it LC.ShadowsocksUser, _ int) string {
+					return it.Username
+				})
+
+				passwords := lo.Map(config.MultiUsers, func(it LC.ShadowsocksUser, _ int) string {
+					return it.Password
+				})
+
+				err = srv.UpdateUsersWithPasswords(userNames, passwords)
+			}
+		} else {
+			sl.service, err = shadowaead_2022.NewServiceWithPassword(config.Cipher, config.Password, udpTimeout, h, ntp.Now)
+		}
 	default:
 		err = fmt.Errorf("shadowsocks: unsupported method: %s", config.Cipher)
 		return embedSS.New(config, tunnel, additions...)
